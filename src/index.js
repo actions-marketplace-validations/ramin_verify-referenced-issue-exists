@@ -3,13 +3,19 @@ const github = require('@actions/github');
 const context = github.context;
 const token = process.env.GITHUB_TOKEN;
 const octokit = github.getOctokit(token);
-const fs = require('fs')
+const fs = require('fs');
+const _ = require('lodash');
 
 const successMessage = "Referenced issue found in commit message or PR body."
 const defaultErrorMessage = "No referenced issue found. Please create an issue and reference it in the commit message or PR body."
 
 async function verifyLinkedIssue() {
-  let linkedIssue = await checkBodyForValidIssue(context, github);
+  let linkedIssue = await checkBodyForValidIssueLink(context, github);
+
+  if (!linkedIssue) {
+    linkedIssue = await checkBodyForValidIssueRef(context, github);
+  }
+
   if (!linkedIssue) {
     linkedIssue = await checkEventsListForConnectedEvent(context, github);
   }
@@ -27,13 +33,49 @@ async function verifyLinkedIssue() {
   }
 }
 
-async function checkBodyForValidIssue(context, github){
+async function checkBodyForValidIssueRef(context, github){
   let body = context.payload.pull_request.body;
   if (!body){
     return false;
   }
   core.debug(`Checking PR Body: "${body}"`)
   const re = /#(.*?)[\s]/g;
+  const matches = body.match(re);
+  core.debug(`regex matches: ${matches}`)
+  if(matches){
+    for(let i=0,len=matches.length;i<len;i++){
+      let match = matches[i];
+      let issueId = match.replace('#','').trim();
+      core.debug(`verifying match is a valid issue issueId: ${issueId}`)
+      try{
+        let issue = await  octokit.rest.issues.get({
+          owner: context.repo.owner,
+          repo: context.repo.repo,
+          issue_number: issueId,
+        });
+        if(issue){
+          core.debug(`Found issue in PR Body ${issueId}`);
+          return true;
+        }
+      }
+      catch{
+        core.debug(`#${issueId} is not a valid issue.`);
+      }
+    }
+  }
+  return false;
+}
+
+async function checkBodyForValidIssueLink(context, github){
+  let body = context.payload.pull_request.body;
+  if (!body){
+    return false;
+  }
+  core.debug(`Checking PR Body: "${body}"`)
+  const pattern = _.escapeRegExp(`${context.payload.repository.full_name}/issues/`)
+  core.debug(pattern)
+  const re = new RegExp(`${pattern}(\\d+)`);
+  core.debug("regexp: " + re);
   const matches = body.match(re);
   core.debug(`regex matches: ${matches}`)
   if(matches){
@@ -78,6 +120,12 @@ async function checkEventsListForConnectedEvent(context, github){
   return false;
 }
 
+async function checkForIgnoreLabel(context) {
+  const ignore = core.getInput('ignore_label') || ''
+  const pr_labels = context.payload.pull_request.labels.map(x => x.name)
+  return _.includes(pr_labels, ignore);
+}
+
 async function createMissingIssueComment(context) {
   let comment = core.getInput('comment');
   let messageBody = comment.body ? comment.message : defaultErrorMessage;
@@ -119,6 +167,14 @@ async function run() {
     }
 
     core.debug('Starting Linked Issue Verification!');
+
+    const ignoreLabels = await checkForIgnoreLabel(context);
+
+    if(ignoreLabels){
+      core.notice('Pull Request has ignore label, skipping verification');
+      return;
+    }
+
     await verifyLinkedIssue();
 
   } catch (err) {
